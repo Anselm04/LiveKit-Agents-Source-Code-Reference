@@ -20,6 +20,8 @@ jobs:
           set -euo pipefail
           tmp=$(mktemp -d)
           git clone --depth 1 --no-checkout https://github.com/livekit/agents.git "$tmp/source"
+          git -C "$tmp/source" fetch --depth 1 origin eb1712c79245eb36b06b91288fa968669e49aa4e
+          git -C "$tmp/source" update-ref HEAD eb1712c79245eb36b06b91288fa968669e49aa4e
           python3 - "$tmp/source" <<'PY'
           import subprocess,sys,json,os
           from pathlib import Path
@@ -38,6 +40,10 @@ jobs:
           for path,(mode,kind,oid) in entries.items():
               if path.startswith('.github/workflows/') or kind!='blob':
                   excluded[path]='upstream workflow disabled' if kind=='blob' else 'external submodule pointer'
+                  continue
+              data=git('cat-file','blob',oid)
+              if data.startswith(b'version https://git-lfs.github.com/spec/v1\n'):
+                  excluded[path]='external LFS asset not imported; avoid incomplete push and storage costs'
                   continue
               if path.startswith('.trillionai/') or path=='.github/workflows/import-reference.yml':
                   raise RuntimeError('Reserved import path collision: '+path)
