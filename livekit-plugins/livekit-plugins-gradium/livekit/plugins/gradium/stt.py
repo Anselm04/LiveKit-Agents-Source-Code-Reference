@@ -1,0 +1,626 @@
+# Copyright 2023 LiveKit, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import dataclasses
+import json
+import os
+import weakref
+from collections import deque
+from dataclasses import dataclass
+from typing import Any, Literal
+
+import aiohttp
+
+from livekit.agents import (
+    DEFAULT_API_CONNECT_OPTIONS,
+    APIConnectOptions,
+    APIStatusError,
+    LanguageCode,
+    stt,
+    utils,
+)
+from livekit.agents.types import NOT_GIVEN, NotGivenOr
+from livekit.agents.utils import AudioBuffer, is_given
+from livekit.rtc import AudioFrame
+
+from .api import ws_headers
+from .log import log_server_message, logger
+from .models import LogLevel
+from .tts import _close_error
+
+STTEncoding = Literal["pcm_s16le"]
+
+# Define bytes per frame for different encoding types
+bytes_per_frame = {
+    "pcm_s16le": 2,
+}
+
+
+SUPPORTED_SAMPLE_RATE = 24000
+# Gradium's default model delay, used until the server's ready message arrives
+DEFAULT_DELAY_IN_FRAMES = 10
+
+
+def _api_error(msg_data: dict[str, Any]) -> APIStatusError:
+    """Build the error for a `{"type": "error"}` frame.
+
+    The server sends it right before closing the socket, so the message is the only
+    place the actual failure reason (unsupported language, no credits, ...) shows up.
+    Its `code` is the websocket close code that follows; client errors are not retried.
+    """
+    message = msg_data.get("message") or "unknown error"
+    return _close_error(
+        f"Gradium returned error: {message}", code=msg_data.get("code"), body=msg_data
+    )
+
+
+@dataclass
+class STTOptions:
+    sample_rate: int = SUPPORTED_SAMPLE_RATE
+    buffer_size_seconds: float = 0.08
+    encoding: str = "pcm_s16le"
+    temperature: float | None = None
+    language: LanguageCode = LanguageCode("en")
+    vad_threshold: float = 0.6
+    vad_bucket: int | None = 2
+    # When set, we flush the stt state on the first time the VAD triggers
+    # in order to recover the text currently being processed as soon as possible.
+    vad_flush: bool = True
+    # When set, a VAD inactivity probability below this threshold signals the start of
+    # speech before any text is transcribed, which allows a faster barge-in.
+    vad_start_threshold: float | None = None
+    # Words or phrases to favor in the transcript, such as product names or jargon.
+    keywords: list[str] | None = None
+    # How strongly to favor the keywords, the server defaults to 2.0.
+    keyword_boost: float | None = None
+    # Lowest level of the server's log messages to receive; None asks for none.
+    log_level: LogLevel | None = None
+
+
+class STT(stt.STT):
+    def __init__(
+        self,
+        *,
+        api_key: str | None = None,
+        model_endpoint: str | None = None,
+        model_name: str = "default",
+        sample_rate: int = SUPPORTED_SAMPLE_RATE,
+        encoding: NotGivenOr[STTEncoding] = NOT_GIVEN,
+        buffer_size_seconds: float = 0.08,
+        http_session: aiohttp.ClientSession | None = None,
+        vad_threshold: float = 0.9,
+        vad_bucket: int | None = 2,
+        vad_flush: bool = True,
+        vad_start_threshold: float | None = None,
+        temperature: float | None = None,
+        language: str = "en",
+        keywords: list[str] | None = None,
+        keyword_boost: float | None = None,
+        log_level: LogLevel | None = None,
+    ):
+        """
+        Create a Gradium STT.
+
+        Args:
+            log_level: Opt in to the server's log messages, such as a warning about an
+                unknown or deprecated setup option: the lowest level to receive ("debug",
+                "info", "warning" or "error"). They are written to the
+                `livekit.plugins.gradium` logger at their own level. Off by default.
+        """
+        super().__init__(
+            capabilities=stt.STTCapabilities(
+                streaming=True,
+                interim_results=True,  # only final transcripts
+                aligned_transcript=False,  # only chunk start times are available
+                offline_recognize=False,
+            ),
+        )
+
+        api_key = api_key or os.environ.get("GRADIUM_API_KEY")
+
+        if sample_rate != SUPPORTED_SAMPLE_RATE:
+            raise ValueError(f"Only {SUPPORTED_SAMPLE_RATE}Hz sample rate is supported")
+
+        if not api_key:
+            raise ValueError(
+                "Gradium API key is required. "
+                "Pass one in via the `api_key` parameter, "
+                "or set it as the `GRADIUM_API_KEY` environment variable"
+            )
+
+        self._api_key = api_key
+
+        model_endpoint = (
+            model_endpoint
+            or os.environ.get("GRADIUM_MODEL_ENDPOINT")
+            or "wss://api.gradium.ai/api/speech/asr"
+        )
+
+        self._model_endpoint = model_endpoint
+        self._model_name = model_name
+
+        self._opts = STTOptions(
+            sample_rate=sample_rate,
+            buffer_size_seconds=buffer_size_seconds,
+            vad_threshold=vad_threshold,
+            vad_bucket=vad_bucket,
+            vad_flush=vad_flush,
+            vad_start_threshold=vad_start_threshold,
+            temperature=temperature,
+            language=LanguageCode(language),
+            keywords=list(keywords) if keywords is not None else None,
+            keyword_boost=keyword_boost,
+            log_level=log_level,
+        )
+
+        if is_given(encoding):
+            self._opts.encoding = encoding
+
+        self._session = http_session
+        self._streams = weakref.WeakSet[SpeechStream]()
+
+    @property
+    def model(self) -> str:
+        return self._model_name
+
+    @property
+    def provider(self) -> str:
+        return "Gradium"
+
+    @property
+    def session(self) -> aiohttp.ClientSession:
+        if not self._session:
+            self._session = utils.http_context.http_session()
+        return self._session
+
+    async def _recognize_impl(
+        self,
+        buffer: AudioBuffer,
+        *,
+        language: NotGivenOr[str] = NOT_GIVEN,
+        conn_options: APIConnectOptions,
+    ) -> stt.SpeechEvent:
+        raise NotImplementedError("Not implemented")
+
+    def stream(
+        self,
+        *,
+        language: NotGivenOr[str] = NOT_GIVEN,
+        conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
+    ) -> SpeechStream:
+        config = dataclasses.replace(self._opts)
+        if is_given(language):
+            config.language = LanguageCode(language)
+        stream = SpeechStream(
+            stt=self,
+            conn_options=conn_options,
+            opts=config,
+            api_key=self._api_key,
+            model_endpoint=self._model_endpoint,
+            model_name=self._model_name,
+            http_session=self.session,
+        )
+        self._streams.add(stream)
+        return stream
+
+    def update_options(
+        self,
+        *,
+        buffer_size_seconds: NotGivenOr[float] = NOT_GIVEN,
+    ) -> None:
+        if is_given(buffer_size_seconds):
+            self._opts.buffer_size_seconds = buffer_size_seconds
+
+        for stream in self._streams:
+            stream.update_options(
+                buffer_size_seconds=buffer_size_seconds,
+            )
+
+
+class _PaddedTimeline:
+    """Maps provider timestamps back to caller audio time by removing synthetic padding.
+
+    Provider timestamps arrive in order, so padding that ends before a timestamp is
+    settled into a running total and later lookups only scan the padding still ahead.
+    """
+
+    def __init__(self, sample_rate: int) -> None:
+        self._sample_rate = sample_rate
+        self._sent_samples = 0
+        self._settled_padding = 0.0
+        # (provider start, duration) of padding a later timestamp may still precede
+        self._pending_padding: deque[tuple[float, float]] = deque()
+
+    def reset(self) -> None:
+        """Restart at provider time zero, for a new connection."""
+        self._sent_samples = 0
+        self._settled_padding = 0.0
+        self._pending_padding.clear()
+
+    def add_audio(self, samples: int) -> None:
+        """Advance the provider clock by ``samples`` of caller audio."""
+        self._sent_samples += samples
+
+    def add_padding(self, samples: int) -> None:
+        """Advance the provider clock by ``samples`` of synthetic silence.
+
+        The padding is recorded so that ``remove_padding`` can subtract it.
+        """
+        start = self._sent_samples / self._sample_rate
+        self._pending_padding.append((start, samples / self._sample_rate))
+        self._sent_samples += samples
+
+    def remove_padding(self, provider_time: float) -> float:
+        """Return the caller audio sent before ``provider_time``, in seconds."""
+        while self._pending_padding:
+            start, duration = self._pending_padding[0]
+            if start + duration > provider_time:
+                break
+            self._settled_padding += duration
+            self._pending_padding.popleft()
+
+        # a late boundary can precede padding that has already been sent
+        pending = sum(
+            min(max(provider_time - start, 0.0), duration)
+            for start, duration in self._pending_padding
+        )
+        return provider_time - self._settled_padding - pending
+
+
+class SpeechStream(stt.SpeechStream):
+    @dataclass
+    class _VADFlush(stt.SpeechStream._FlushSentinel):
+        """Request synthetic silence without advancing the caller's audio clock."""
+
+        samples_per_channel: int
+
+    def __init__(
+        self,
+        *,
+        stt: STT,
+        opts: STTOptions,
+        conn_options: APIConnectOptions,
+        api_key: str,
+        model_endpoint: str,
+        model_name: str,
+        http_session: aiohttp.ClientSession,
+    ) -> None:
+        super().__init__(stt=stt, conn_options=conn_options, sample_rate=opts.sample_rate)
+
+        self._opts = opts
+        self._api_key = api_key
+        self._model_endpoint = model_endpoint
+        self._model_name = model_name
+        self._session = http_session
+        self._speech_duration: float = 0
+
+        self._reconnect_event = asyncio.Event()
+        self._ready_msg: dict[str, Any] | None = None
+
+    @property
+    def delay_in_frames(self) -> int:
+        """Steps the model lags behind the audio, from the server's ready message."""
+        if self._ready_msg is not None:
+            return int(self._ready_msg.get("delay_in_frames", DEFAULT_DELAY_IN_FRAMES))
+        return DEFAULT_DELAY_IN_FRAMES
+
+    @property
+    def frame_size(self) -> int:
+        if self._ready_msg is not None:
+            return int(self._ready_msg.get("frame_size", 1920))
+        return 1920
+
+    def update_options(
+        self,
+        *,
+        buffer_size_seconds: NotGivenOr[float] = NOT_GIVEN,
+    ) -> None:
+        if is_given(buffer_size_seconds):
+            self._opts.buffer_size_seconds = buffer_size_seconds
+
+        self._reconnect_event.set()
+
+    async def _run(self) -> None:
+        """
+        Run a single websocket connection to Gradium and make sure to reconnect
+        when something went wrong.
+        """
+
+        closing_ws = False
+        timeline = _PaddedTimeline(self._opts.sample_rate)
+
+        async def send_task(ws: aiohttp.ClientWebSocketResponse) -> None:
+            nonlocal closing_ws
+            samples_per_buffer = 1920
+
+            audio_bstream = utils.audio.AudioByteStream(
+                sample_rate=self._opts.sample_rate,
+                num_channels=1,
+                samples_per_channel=samples_per_buffer,
+            )
+
+            async for data in self._input_ch:
+                if isinstance(data, self._VADFlush):
+                    zeros = AudioFrame.create(
+                        sample_rate=self._opts.sample_rate,
+                        num_channels=1,
+                        samples_per_channel=data.samples_per_channel,
+                    )
+                    timeline.add_padding(zeros.samples_per_channel)
+                    frames = audio_bstream.write(zeros.data.tobytes())
+                elif isinstance(data, self._FlushSentinel):
+                    frames = audio_bstream.flush()
+                else:
+                    timeline.add_audio(data.samples_per_channel)
+                    frames = audio_bstream.write(data.data.tobytes())
+
+                for frame in frames:
+                    if len(frame.data) % 2 != 0:
+                        logger.warning("Frame data size not aligned to int16 (multiple of 2)")
+
+                    audio_data = base64.b64encode(frame.data.tobytes()).decode("utf-8")
+                    audio_msg = {
+                        "type": "audio",
+                        "audio": audio_data,
+                    }
+                    try:
+                        await ws.send_str(json.dumps(audio_msg))
+                    except (aiohttp.ClientError, ConnectionError):
+                        # the server closed first; recv_task raises the retryable error
+                        return
+
+            # Input ended: tell the server, then let recv_task drain the model's last
+            # words until the server replies with its own end_of_stream.
+            closing_ws = True
+            try:
+                await ws.send_str(json.dumps({"type": "end_of_stream"}))
+            except (aiohttp.ClientError, ConnectionError):
+                # the server closed first; recv_task reports what it got
+                return
+
+        async def recv_task(ws: aiohttp.ClientWebSocketResponse) -> None:
+            nonlocal closing_ws
+            buffered_text: list[str] = []
+            speech_end = 0.0
+            speaking = False
+            remaining_vad_steps: int | None = None
+            monitor = utils.aio.WebSocketMonitor(
+                ws, liveness_timeout=self._conn_options.liveness_timeout
+            )
+
+            def _finalize() -> None:
+                nonlocal speaking, remaining_vad_steps, buffered_text, speech_end
+                if not speaking:
+                    return
+                speaking = False
+                remaining_vad_steps = None
+                event = stt.SpeechEvent(
+                    type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                    alternatives=[
+                        stt.SpeechData(
+                            text=" ".join(buffered_text),
+                            language=self._opts.language,
+                            end_time=timeline.remove_padding(speech_end) + self.start_time_offset
+                            if speech_end > 0
+                            else 0.0,
+                        )
+                    ],
+                )
+                self._event_ch.send_nowait(event)
+                buffered_text = []
+                self._event_ch.send_nowait(
+                    stt.SpeechEvent(
+                        type=stt.SpeechEventType.END_OF_SPEECH,
+                        alternatives=event.alternatives if speech_end > 0 else [],
+                    )
+                )
+                speech_end = 0.0
+
+            while True:
+                try:
+                    msg = await asyncio.wait_for(monitor.receive(), timeout=5)
+                except asyncio.TimeoutError:
+                    if closing_ws:
+                        # the server did not answer the end_of_stream in time: keep
+                        # what the model already produced
+                        _finalize()
+                        return
+                    continue
+
+                if msg.type in (
+                    aiohttp.WSMsgType.CLOSED,
+                    aiohttp.WSMsgType.CLOSE,
+                    aiohttp.WSMsgType.CLOSING,
+                ):
+                    if closing_ws:
+                        # a close instead of the server's end_of_stream: same thing
+                        _finalize()
+                        return
+                    raise APIStatusError(
+                        "Gradium connection closed unexpectedly",
+                        status_code=ws.close_code or -1,
+                        body=f"{msg.data=} {msg.extra=}",
+                    )
+
+                if msg.type != aiohttp.WSMsgType.TEXT:
+                    logger.error("Unexpected Gradium message type: %s", msg.type)
+                    continue
+
+                try:
+                    data = json.loads(msg.data)
+                except json.JSONDecodeError:
+                    logger.exception("Failed to decode message from Gradium")
+                    continue
+                if not isinstance(data, dict):
+                    logger.error("Unexpected Gradium message: %s", msg.data)
+                    continue
+
+                type_ = data.get("type", "")
+                if type_ == "error":
+                    raise _api_error(data)
+                if type_ == "end_of_stream":
+                    # The model has consumed all the audio: whatever is still buffered
+                    # is the end of the last utterance.
+                    _finalize()
+                    if closing_ws:
+                        return
+                    # The server ended the session while audio is still coming (a
+                    # duration limit, for instance) and will close the socket; raise
+                    # so the base class reconnects instead of the next audio write
+                    # failing with a raw connection error.
+                    raise APIStatusError(
+                        "Gradium ended the session while input was still open",
+                        status_code=ws.close_code or -1,
+                        body=data,
+                    )
+
+                try:
+                    if type_ == "text":
+                        speech_end = 0.0
+                        if speaking is False:
+                            speaking = True
+                            start_event = stt.SpeechEvent(type=stt.SpeechEventType.START_OF_SPEECH)
+                            self._event_ch.send_nowait(start_event)
+                        buffered_text.append(data["text"])
+                        event = stt.SpeechEvent(
+                            type=stt.SpeechEventType.INTERIM_TRANSCRIPT,
+                            alternatives=[
+                                stt.SpeechData(
+                                    text=data["text"],
+                                    language=self._opts.language,
+                                    start_time=timeline.remove_padding(data["start_s"])
+                                    + self.start_time_offset,
+                                )
+                            ],
+                        )
+                        self._event_ch.send_nowait(event)
+
+                    elif type_ == "step":
+                        if not speaking:
+                            start_threshold = self._opts.vad_start_threshold
+                            vad_bucket = self._opts.vad_bucket
+                            # steps sent before any audio was processed carry a warm-up
+                            # estimate that reads as activity, ignore them
+                            if (
+                                vad_bucket is not None
+                                and start_threshold is not None
+                                and data.get("total_duration_s", 0.0) > 0
+                                and data["vad"][vad_bucket]["inactivity_prob"] < start_threshold
+                            ):
+                                speaking = True
+                                self._event_ch.send_nowait(
+                                    stt.SpeechEvent(type=stt.SpeechEventType.START_OF_SPEECH)
+                                )
+                            self._mark_provider_progress()
+                            continue
+                        if (vad_bucket := self._opts.vad_bucket) is not None:
+                            positive_vad = (
+                                data["vad"][vad_bucket]["inactivity_prob"]
+                                > self._opts.vad_threshold
+                            )
+                            if positive_vad:
+                                if remaining_vad_steps is None:
+                                    remaining_vad_steps = self.delay_in_frames
+                                    if self._opts.vad_flush and not self._input_ch.closed:
+                                        await self._input_ch.send(
+                                            self._VADFlush(self.frame_size * self.delay_in_frames)
+                                        )
+                                else:
+                                    remaining_vad_steps -= 1
+                                    if remaining_vad_steps <= 0:
+                                        _finalize()
+                            else:
+                                remaining_vad_steps = None
+
+                    elif type_ == "ready":
+                        self._ready_msg = data
+                    elif type_ == "end_text":
+                        if speaking:
+                            speech_end = data.get("stop_s", 0.0)
+                    elif type_ == "log":
+                        log_server_message(data)
+                    else:
+                        logger.warning(f"Unknown message type from Gradium {type_}")
+
+                    if type_ in ("text", "step", "end_text"):
+                        self._mark_provider_progress()
+
+                except Exception:
+                    logger.exception("Failed to process message from Gradium")
+
+        ws: aiohttp.ClientWebSocketResponse | None = None
+
+        while True:
+            try:
+                ws = await self._connect_ws()
+                self._input_ch.restart_provider_clock()
+                timeline.reset()
+                tasks = [
+                    asyncio.create_task(send_task(ws)),
+                    asyncio.create_task(recv_task(ws)),
+                ]
+                wait_reconnect_task = asyncio.create_task(self._reconnect_event.wait())
+
+                tasks_group: asyncio.Future[Any] = asyncio.gather(*tasks)
+                try:
+                    done, _ = await asyncio.wait(
+                        [tasks_group, wait_reconnect_task],
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for task in done:
+                        if task != wait_reconnect_task:
+                            task.result()
+
+                    if wait_reconnect_task not in done:
+                        break
+
+                    self._reconnect_event.clear()
+                finally:
+                    await utils.aio.gracefully_cancel(*tasks, wait_reconnect_task)
+                    tasks_group.cancel()
+                    tasks_group.exception()
+            finally:
+                if ws is not None:
+                    await ws.close()
+
+    async def _connect_ws(self) -> aiohttp.ClientWebSocketResponse:
+        ws = await self._session.ws_connect(
+            self._model_endpoint, headers=ws_headers(self._api_key), autoping=False
+        )
+
+        # Build and send the setup payload as the first message
+        setup_msg: dict[str, Any] = {
+            "type": "setup",
+            "model_name": self._model_name,
+            "input_format": "pcm",
+        }
+        json_config: dict[str, Any] = {"language": self._opts.language.language}
+        if self._opts.temperature is not None:
+            json_config["temp"] = self._opts.temperature
+        if self._opts.keywords:
+            keywords: dict[str, Any] = {"words": self._opts.keywords}
+            if self._opts.keyword_boost is not None:
+                keywords["boost"] = self._opts.keyword_boost
+            json_config["keywords"] = keywords
+        setup_msg["json_config"] = json_config
+        if self._opts.log_level is not None:
+            setup_msg["log_level"] = self._opts.log_level
+
+        await ws.send_str(json.dumps(setup_msg))
+        return ws

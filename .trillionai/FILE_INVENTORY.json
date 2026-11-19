@@ -1,0 +1,43 @@
+{
+  "upstream": "https://github.com/livekit/agents",
+  "upstream_commit": "eb1712c79245eb36b06b91288fa968669e49aa4e",
+  "upstream_tree": "c3b224af9924fd6b9f9a473503ce36e46fd08eda",
+  "upstream_tracked_entries": 1692,
+  "upstream_blob_files": 1692,
+  "expected_source_files": 1666,
+  "verified_source_files": 1666,
+  "excluded_paths": {
+    ".github/workflows/auto-assign.yml": "upstream workflow disabled",
+    ".github/workflows/build.yml": "upstream workflow disabled",
+    ".github/workflows/ci.yml": "upstream workflow disabled",
+    ".github/workflows/data-capture-sim.yml": "upstream workflow disabled",
+    ".github/workflows/deploy-examples.yml": "upstream workflow disabled",
+    ".github/workflows/deploy-homepage-examples.yml": "upstream workflow disabled",
+    ".github/workflows/download-stats.yml": "upstream workflow disabled",
+    ".github/workflows/evals.yml": "upstream workflow disabled",
+    ".github/workflows/publish-docs.yml": "upstream workflow disabled",
+    ".github/workflows/publish.yml": "upstream workflow disabled",
+    ".github/workflows/release-gate.yml": "upstream workflow disabled",
+    ".github/workflows/test-realtime.yml": "upstream workflow disabled",
+    ".github/workflows/test-stt.yml": "upstream workflow disabled",
+    ".github/workflows/tests.yml": "upstream workflow disabled",
+    "examples/drive_thru/bg_noise.mp3": "external LFS asset not imported; avoid incomplete push and storage costs",
+    "livekit-agents/livekit/agents/resources/city-ambience.ogg": "external LFS asset not imported; avoid incomplete push and storage costs",
+    "livekit-agents/livekit/agents/resources/crowded-room.ogg": "external LFS asset not imported; avoid incomplete push and storage costs",
+    "livekit-agents/livekit/agents/resources/forest-ambience.ogg": "external LFS asset not imported; avoid incomplete push and storage costs",
+    "livekit-agents/livekit/agents/resources/hold_music.ogg": "external LFS asset not imported; avoid incomplete push and storage costs",
+    "livekit-agents/livekit/agents/resources/keyboard-typing.ogg": "external LFS asset not imported; avoid incomplete push and storage costs",
+    "livekit-agents/livekit/agents/resources/keyboard-typing2.ogg": "external LFS asset not imported; avoid incomplete push and storage costs",
+    "livekit-agents/livekit/agents/resources/office-ambience.ogg": "external LFS asset not imported; avoid incomplete push and storage costs",
+    "livekit-plugins/livekit-plugins-silero/livekit/plugins/silero/resources/silero_vad.onnx": "external LFS asset not imported; avoid incomplete push and storage costs",
+    "tests/change-sophie.opus": "external LFS asset not imported; avoid incomplete push and storage costs",
+    "tests/change-sophie.wav": "external LFS asset not imported; avoid incomplete push and storage costs",
+    "tests/long.mp3": "external LFS asset not imported; avoid incomplete push and storage costs"
+  },
+  "missing_paths": [],
+  "mismatched_paths": [],
+  "extra_paths": [
+    ".github/workflows/import-reference.yml"
+  ],
+  "scope": "Tracked Git blobs; no external LFS payloads, submodule contents or full history."
+}
